@@ -1,3 +1,4 @@
+#!/bin/bash
 if [ "$#" -ne 2 ] ; then
 echo "build-llvm.sh base <target dir>"
 echo "build-llvm.sh freeze <target dir>"
