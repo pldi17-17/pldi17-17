@@ -1,3 +1,4 @@
+#!/bin/bash
 if [ "$#" -ne 1 ] ; then
 echo "build.sh <llvm-dir>"
 exit 1
