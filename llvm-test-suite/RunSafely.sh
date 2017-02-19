@@ -195,11 +195,11 @@ fi
 rm -f "${OUTFILE}.time" "${OUTFILE}" "${STDOUT_FILE}" "${STDERR_FILE}"
 if [ "x$RHOST" = x ] ; then
    $TIMEIT $TIMEITFLAGS $COMMAND
-  #echo "1sfairport1" | sudo -S PYTHONPATH="/mnt/freezedisk/cpuset:$PYTHONPATH" cset shield -c 1-3
-  #sleep 0.02
-  #echo "1sfairport1" | sudo -S PYTHONPATH="/mnt/freezedisk/cpuset:$PYTHONPATH" cset shield --user=sflab --group=sflab --exec $TIMEIT -- $TIMEITFLAGS $COMMAND
-  #echo "1sfairport1" | sudo -S PYTHONPATH="/mnt/freezedisk/cpuset:$PYTHONPATH" cset shield --reset
-  #sleep 0.02
+  #echo "pldi201717" | sudo -S PYTHONPATH="/mnt/freezedisk/cpuset:$PYTHONPATH" cset shield -c 1-3
+  #sleep 0.03
+  #echo "pldi201717" | sudo -S PYTHONPATH="/mnt/freezedisk/cpuset:$PYTHONPATH" cset shield --user=pldi1717 --group=pldi1717 --exec $TIMEIT -- $TIMEITFLAGS $COMMAND
+  #echo "pldi201717" | sudo -S PYTHONPATH="/mnt/freezedisk/cpuset:$PYTHONPATH" cset shield --reset
+  #sleep 0.03
 else
   rm -f "${OUTFILE}.time${REMOTE_SUFFIX}" "${OUTFILE}${REMOTE_SUFFIX}"
   rm -f "${STDOUT_FILE}${REMOTE_SUFFIX}" "${STDERR_FILE}${REMOTE_SUFFIX}"
