@@ -1,0 +1,1199 @@
+diff --git a/include/llvm-c/Core.h b/include/llvm-c/Core.h
+index 6bdb96a..604af90 100644
+--- a/include/llvm-c/Core.h
++++ b/include/llvm-c/Core.h
+@@ -179,7 +179,10 @@ typedef enum {
+   LLVMCatchRet       = 62,
+   LLVMCatchPad       = 63,
+   LLVMCleanupPad     = 64,
+-  LLVMCatchSwitch    = 65
++  LLVMCatchSwitch    = 65,
++
++  /* Undef Handling Operators */
++  LLVMFreeze         = 66
+ } LLVMOpcode;
+
+ typedef enum {
+@@ -1251,6 +1254,7 @@ LLVMTypeRef LLVMX86MMXType(void);
+       macro(SelectInst)                     \
+       macro(ShuffleVectorInst)              \
+       macro(StoreInst)                      \
++      macro(FreezeInst)                     \
+       macro(TerminatorInst)                 \
+         macro(BranchInst)                   \
+         macro(IndirectBrInst)               \
+@@ -3092,6 +3096,8 @@ LLVMValueRef LLVMBuildExtractValue(LLVMBuilderRef, LLVMValueRef AggVal,
+ LLVMValueRef LLVMBuildInsertValue(LLVMBuilderRef, LLVMValueRef AggVal,
+                                   LLVMValueRef EltVal, unsigned Index,
+                                   const char *Name);
++LLVMValueRef LLVMBuildFreeze(LLVMBuilderRef, LLVMValueRef Val,
++                                   const char *Name);
+
+ LLVMValueRef LLVMBuildIsNull(LLVMBuilderRef, LLVMValueRef Val,
+                              const char *Name);
+diff --git a/include/llvm/Analysis/InstructionSimplify.h b/include/llvm/Analysis/InstructionSimplify.h
+index cfec2ef..1f82da7 100644
+--- a/include/llvm/Analysis/InstructionSimplify.h
++++ b/include/llvm/Analysis/InstructionSimplify.h
+@@ -323,6 +323,14 @@ namespace llvm {
+                       AssumptionCache *AC = nullptr,
+                       const Instruction *CxtI = nullptr);
+
++  /// SimplifyFreezeInst - Given operands for a Freeze, see if we can
++  /// fold the result.  If not, this returns null.
++  Value *SimplifyFreezeInst(Value *Op, const DataLayout &DL,
++                         const TargetLibraryInfo *TLI = nullptr,
++                         const DominatorTree *DT = nullptr,
++                         AssumptionCache *AC = nullptr,
++                         const Instruction *CxtI = nullptr);
++
+   /// SimplifyInstruction - See if we can compute a simplified version of this
+   /// instruction.  If not, this returns null.
+   Value *SimplifyInstruction(Instruction *I, const DataLayout &DL,
+diff --git a/include/llvm/Bitcode/LLVMBitCodes.h b/include/llvm/Bitcode/LLVMBitCodes.h
+index d2a6a19..a55a912 100644
+--- a/include/llvm/Bitcode/LLVMBitCodes.h
++++ b/include/llvm/Bitcode/LLVMBitCodes.h
+@@ -462,6 +462,7 @@ enum FunctionCodes {
+   // 53 is unused.
+   // 54 is unused.
+   FUNC_CODE_OPERAND_BUNDLE = 55, // OPERAND_BUNDLE: [tag#, value...]
++  FUNC_CODE_INST_FREEZE = 56,    // FREEZE: [opty, opval]
+ };
+
+ enum UseListCodes {
+diff --git a/include/llvm/CodeGen/ISDOpcodes.h b/include/llvm/CodeGen/ISDOpcodes.h
+index 666671c..5d860b2 100644
+--- a/include/llvm/CodeGen/ISDOpcodes.h
++++ b/include/llvm/CodeGen/ISDOpcodes.h
+@@ -172,6 +172,9 @@ namespace ISD {
+     /// UNDEF - An undefined node.
+     UNDEF,
+
++    /// FREEZE - A freeze node.
++    FREEZE,
++
+     /// EXTRACT_ELEMENT - This is used to get the lower or upper (determined by
+     /// a Constant, which is required to be operand #1) half of the integer or
+     /// float value specified as operand #0.  This is only for use before
+diff --git a/include/llvm/CodeGen/SelectionDAGISel.h b/include/llvm/CodeGen/SelectionDAGISel.h
+index 7f4549d..4cab97e 100644
+--- a/include/llvm/CodeGen/SelectionDAGISel.h
++++ b/include/llvm/CodeGen/SelectionDAGISel.h
+@@ -265,6 +265,8 @@ private:
+   void Select_UNDEF(SDNode *N);
+   void CannotYetSelect(SDNode *N);
+
++  void Select_FREEZE(SDNode *N);
++
+ private:
+   void DoInstructionSelection();
+   SDNode *MorphNode(SDNode *Node, unsigned TargetOpc, SDVTList VTs,
+diff --git a/include/llvm/IR/IRBuilder.h b/include/llvm/IR/IRBuilder.h
+index efe4c38..dc68dbb 100644
+--- a/include/llvm/IR/IRBuilder.h
++++ b/include/llvm/IR/IRBuilder.h
+@@ -1669,6 +1669,10 @@ public:
+     return Insert(InsertValueInst::Create(Agg, Val, Idxs), Name);
+   }
+
++  Value *CreateFreeze(Value *V, const Twine &Name = "") {
++    return Insert(new FreezeInst(V), Name);
++  }
++
+   LandingPadInst *CreateLandingPad(Type *Ty, unsigned NumClauses,
+                                    const Twine &Name = "") {
+     return Insert(LandingPadInst::Create(Ty, NumClauses), Name);
+@@ -1690,6 +1694,47 @@ public:
+                         Name);
+   }
+
++  /// \brief If \p Arg is guaranteed not to be undef, return \p Arg.
++  /// Otherwise, insert a freeze instruction at the definition of \p Arg and return
++  /// the new value
++  Value *CreateFreezeAtDef(Value *Arg, Function *F, const Twine &Name = "",
++                           bool replaceAllUses = true) {
++    if (FreezeInst::isGuaranteedNotToBeUndef(Arg))
++      return Arg;
++
++    assert (!isa<Constant>(Arg) && "Constant has no def");
++
++    if (Instruction *I = dyn_cast<Instruction>(Arg)) {
++      FreezeInst *FI = new FreezeInst(I, Name);
++      BasicBlock *BB = I->getParent();
++      if (isa<PHINode>(I)) {
++        BB->getInstList().insert(BB->getFirstInsertionPt(), FI);
++      } else if (isa<InvokeInst>(I)) {
++        // invoke is a terminator, so we have to put freeze into
++        // the beginning of its branch.
++        assert (!isa<InvokeInst>(I) && "Cannot put Freeze at def of terminator.");
++      } else {
++        FI->insertAfter(I);
++      }
++      if (replaceAllUses) {
++        I->replaceAllUsesWith(FI);
++        FI->replaceUsesOfWith(FI, I);
++      }
++      return FI;
++    } else {
++      assert(isa<Argument>(Arg) && "Cannot freeze the value");
++      BasicBlock &Entry = F->getEntryBlock();
++      FreezeInst *FI = new FreezeInst(Arg, Name, &*Entry.getFirstInsertionPt());
++      if(replaceAllUses) {
++        Arg->replaceAllUsesWith(FI);
++        FI->replaceUsesOfWith(FI, Arg);
++      }
++      return FI;
++    }
++
++    return nullptr;
++  }
++
+   /// \brief Return the i64 difference between two pointer values, dividing out
+   /// the size of the pointed-to objects.
+   ///
+diff --git a/include/llvm/IR/InstVisitor.h b/include/llvm/IR/InstVisitor.h
+index 088d3e0..b7ad434 100644
+--- a/include/llvm/IR/InstVisitor.h
++++ b/include/llvm/IR/InstVisitor.h
+@@ -206,6 +206,7 @@ public:
+   RetTy visitFuncletPadInst(FuncletPadInst &I) { DELEGATE(Instruction); }
+   RetTy visitCleanupPadInst(CleanupPadInst &I) { DELEGATE(FuncletPadInst); }
+   RetTy visitCatchPadInst(CatchPadInst &I)     { DELEGATE(FuncletPadInst); }
++  RetTy visitFreezeInst(FreezeInst &I)         { DELEGATE(Instruction); }
+
+   // Handle the special instrinsic instruction classes.
+   RetTy visitDbgDeclareInst(DbgDeclareInst &I)    { DELEGATE(DbgInfoIntrinsic);}
+diff --git a/include/llvm/IR/Instruction.def b/include/llvm/IR/Instruction.def
+index 18711ab..3ab7209 100644
+--- a/include/llvm/IR/Instruction.def
++++ b/include/llvm/IR/Instruction.def
+@@ -194,7 +194,8 @@ HANDLE_OTHER_INST(61, ShuffleVector, ShuffleVectorInst)  // shuffle two vectors.
+ HANDLE_OTHER_INST(62, ExtractValue, ExtractValueInst)// extract from aggregate
+ HANDLE_OTHER_INST(63, InsertValue, InsertValueInst)  // insert into aggregate
+ HANDLE_OTHER_INST(64, LandingPad, LandingPadInst)  // Landing pad instruction.
+-  LAST_OTHER_INST(64)
++HANDLE_OTHER_INST(65, Freeze, FreezeInst)  // Freeze instruction.
++  LAST_OTHER_INST(65)
+
+ #undef  FIRST_TERM_INST
+ #undef HANDLE_TERM_INST
+diff --git a/include/llvm/IR/Instructions.h b/include/llvm/IR/Instructions.h
+index e094afa..1ce8761 100644
+--- a/include/llvm/IR/Instructions.h
++++ b/include/llvm/IR/Instructions.h
+@@ -4919,6 +4919,45 @@ public:
+   }
+ };
+
++//===----------------------------------------------------------------------===//
++//                              FreezeInst Class
++//===----------------------------------------------------------------------===//
++
++/// \brief This class represents a freeze function that returns
++/// random concrete value if an operand is an undefine value
++class FreezeInst : public UnaryInstruction {
++protected:
++  // Note: Instruction needs to be a friend here to call cloneImpl.
++  friend class Instruction;
++  /// \brief Clone an identical FreezeInst
++  FreezeInst *cloneImpl() const;
++
++public:
++  /// \brief Constructor with insert-before-instruction semantics
++  FreezeInst(
++    Value *S,                           ///< The value to freeze
++    const Twine &NameStr = "",          ///< A name for the new instruction
++    Instruction *InsertBefore = nullptr ///< Where to insert the new instruction
++  );
++
++  /// \brief Constructor with insert-at-end-of-block semantics
++  FreezeInst(
++    Value *S,                     ///< The value to freeze
++    const Twine &NameStr,         ///< A name for the new instruction
++    BasicBlock *InsertAtEnd       ///< The block to insert the instruction into
++  );
++
++  // Methods for support type inquiry through isa, cast, and dyn_cast:
++  static inline bool classof(const Instruction *I) {
++    return I->getOpcode() == Freeze;
++  }
++  static inline bool classof(const Value *V) {
++    return isa<Instruction>(V) && classof(cast<Instruction>(V));
++  }
++
++  // \brief Checks whether the value never becomes undef
++  static bool isGuaranteedNotToBeUndef(Value *V);
++};
+ } // End llvm namespace
+
+ #endif
+diff --git a/include/llvm/IR/PatternMatch.h b/include/llvm/IR/PatternMatch.h
+index 7da9afc..28eee14 100644
+--- a/include/llvm/IR/PatternMatch.h
++++ b/include/llvm/IR/PatternMatch.h
+@@ -901,6 +901,25 @@ template <typename LHS> inline fneg_match<LHS> m_FNeg(const LHS &L) {
+   return L;
+ }
+
++template <typename Op_t> struct FreezeClass_match {
++  Op_t Op;
++
++  FreezeClass_match(const Op_t &OpMatch) : Op(OpMatch) {}
++
++  template <typename OpTy> bool match(OpTy *V) {
++    if (auto *O = dyn_cast<Operator>(V))
++      return O->getOpcode() == Instruction::Freeze && Op.match(O->getOperand(0));
++    return false;
++  }
++};
++
++/// \brief Matches Freeze.
++template <typename OpTy>
++inline FreezeClass_match<OpTy> m_Freeze(const OpTy &Op) {
++  return FreezeClass_match<OpTy>(Op);
++}
++
++
+ //===----------------------------------------------------------------------===//
+ // Matchers for control flow.
+ //
+diff --git a/lib/Analysis/InstructionSimplify.cpp b/lib/Analysis/InstructionSimplify.cpp
+index b52ffee..106ed15 100644
+--- a/lib/Analysis/InstructionSimplify.cpp
++++ b/lib/Analysis/InstructionSimplify.cpp
+@@ -4052,6 +4052,23 @@ Value *llvm::SimplifyCall(Value *V, ArrayRef<Value *> Args,
+                         Query(DL, TLI, DT, AC, CxtI), RecursionLimit);
+ }
+
++/// Given operands for a Freeze, see if we can fold the result.
++static Value *SimplifyFreezeInst(Value *Op0) {
++  // Currently we don't have constantexpr freeze, so just check
++  // whether it is a ConstantInt.
++  if (isa<ConstantInt>(Op0))
++    return Op0;
++  return nullptr;
++}
++
++Value *llvm::SimplifyFreezeInst(Value *Op0,
++                              const DataLayout &DL,
++                              const TargetLibraryInfo *TLI,
++                              const DominatorTree *DT, AssumptionCache *AC,
++                              const Instruction *CxtI) {
++  return ::SimplifyFreezeInst(Op0);
++}
++
+ /// See if we can compute a simplified version of this instruction.
+ /// If not, this returns null.
+ Value *llvm::SimplifyInstruction(Instruction *I, const DataLayout &DL,
+@@ -4195,6 +4212,10 @@ Value *llvm::SimplifyInstruction(Instruction *I, const DataLayout &DL,
+     Result =
+         SimplifyTruncInst(I->getOperand(0), I->getType(), DL, TLI, DT, AC, I);
+     break;
++  case Instruction::Freeze:
++    Result =
++        SimplifyFreezeInst(I->getOperand(0), DL, TLI, DT, AC, I);
++    break;
+   }
+
+   // In general, it is possible for computeKnownBits to determine all bits in a
+diff --git a/lib/AsmParser/LLLexer.cpp b/lib/AsmParser/LLLexer.cpp
+index a3d1346..db76d56 100644
+--- a/lib/AsmParser/LLLexer.cpp
++++ b/lib/AsmParser/LLLexer.cpp
+@@ -781,6 +781,8 @@ lltok::Kind LLLexer::LexIdentifier() {
+   INSTKEYWORD(catchswitch,  CatchSwitch);
+   INSTKEYWORD(catchpad,     CatchPad);
+   INSTKEYWORD(cleanuppad,   CleanupPad);
++
++  INSTKEYWORD(freeze,       Freeze);
+ #undef INSTKEYWORD
+
+ #define DWKEYWORD(TYPE, TOKEN)                                                 \
+diff --git a/lib/AsmParser/LLParser.cpp b/lib/AsmParser/LLParser.cpp
+index bf4934c..8ada77b 100644
+--- a/lib/AsmParser/LLParser.cpp
++++ b/lib/AsmParser/LLParser.cpp
+@@ -5023,6 +5023,7 @@ int LLParser::ParseInstruction(Instruction *&Inst, BasicBlock *BB,
+   case lltok::kw_shufflevector:  return ParseShuffleVector(Inst, PFS);
+   case lltok::kw_phi:            return ParsePHI(Inst, PFS);
+   case lltok::kw_landingpad:     return ParseLandingPad(Inst, PFS);
++  case lltok::kw_freeze:         return ParseFreeze(Inst, PFS);
+   // Call.
+   case lltok::kw_call:     return ParseCall(Inst, PFS, CallInst::TCK_None);
+   case lltok::kw_tail:     return ParseCall(Inst, PFS, CallInst::TCK_Tail);
+@@ -5823,6 +5824,21 @@ bool LLParser::ParseLandingPad(Instruction *&Inst, PerFunctionState &PFS) {
+   return false;
+ }
+
++/// ParseFreeze
++///   ::= 'freeze' Type Value
++bool LLParser::ParseFreeze(Instruction *&Inst, PerFunctionState &PFS) {
++  LocTy Loc;
++  Value *Op;
++  if (ParseTypeAndValue(Op, Loc, PFS))
++    return true;
++
++  if (!Op->getType()->isIntegerTy())
++    return Error(Loc,"cannot freeze non-integer type");
++
++  Inst = new FreezeInst(Op, "");
++  return false;
++}
++
+ /// ParseCall
+ ///   ::= 'call' OptionalFastMathFlags OptionalCallingConv
+ ///           OptionalAttrs Type Value ParameterList OptionalAttrs
+diff --git a/lib/AsmParser/LLParser.h b/lib/AsmParser/LLParser.h
+index 479ff96..b3399dc 100644
+--- a/lib/AsmParser/LLParser.h
++++ b/lib/AsmParser/LLParser.h
+@@ -497,6 +497,7 @@ namespace llvm {
+     int ParseGetElementPtr(Instruction *&I, PerFunctionState &PFS);
+     int ParseExtractValue(Instruction *&I, PerFunctionState &PFS);
+     int ParseInsertValue(Instruction *&I, PerFunctionState &PFS);
++    bool ParseFreeze(Instruction *&I, PerFunctionState &PFS);
+
+     // Use-list order directives.
+     bool ParseUseListOrder(PerFunctionState *PFS = nullptr);
+diff --git a/lib/AsmParser/LLToken.h b/lib/AsmParser/LLToken.h
+index be3697a..a0d78f1 100644
+--- a/lib/AsmParser/LLToken.h
++++ b/lib/AsmParser/LLToken.h
+@@ -322,6 +322,8 @@ enum Kind {
+   kw_insertvalue,
+   kw_blockaddress,
+
++  kw_freeze,
++
+   // Metadata types.
+   kw_distinct,
+
+diff --git a/lib/Bitcode/Reader/BitcodeReader.cpp b/lib/Bitcode/Reader/BitcodeReader.cpp
+index cdb6a1f..ab11135 100644
+--- a/lib/Bitcode/Reader/BitcodeReader.cpp
++++ b/lib/Bitcode/Reader/BitcodeReader.cpp
+@@ -5491,6 +5491,19 @@ std::error_code BitcodeReader::parseFunctionBody(Function *F) {
+       OperandBundles.emplace_back(BundleTags[Record[0]], std::move(Inputs));
+       continue;
+     }
++
++    case bitc::FUNC_CODE_INST_FREEZE: { // FREEZE: [opty,opval]
++      unsigned OpNum = 0;
++      Value *Op = nullptr;
++      if (getValueTypePair(Record, OpNum, NextValueNo, Op))
++        return error("Invalid record");
++      if (OpNum != Record.size())
++        return error("Invalid record");
++
++      I = new FreezeInst(Op, "");
++      InstructionList.push_back(I);
++      break;
++    }
+     }
+
+     // Add instruction to end of current BB.  If there is no current BB, reject
+diff --git a/lib/Bitcode/Writer/BitcodeWriter.cpp b/lib/Bitcode/Writer/BitcodeWriter.cpp
+index 971d21e..34ce5fe 100644
+--- a/lib/Bitcode/Writer/BitcodeWriter.cpp
++++ b/lib/Bitcode/Writer/BitcodeWriter.cpp
+@@ -2666,6 +2666,10 @@ void ModuleBitcodeWriter::writeInstruction(const Instruction &I,
+     pushValue(I.getOperand(0), InstID, Vals);                   // valist.
+     Vals.push_back(VE.getTypeID(I.getType())); // restype.
+     break;
++  case Instruction::Freeze:
++    Code = bitc::FUNC_CODE_INST_FREEZE;
++    pushValueAndType(I.getOperand(0), InstID, Vals);
++    break;
+   }
+
+   Stream.EmitRecord(Code, Vals, AbbrevToUse);
+diff --git a/lib/CodeGen/CodeGenPrepare.cpp b/lib/CodeGen/CodeGenPrepare.cpp
+index d396137..029a476 100644
+--- a/lib/CodeGen/CodeGenPrepare.cpp
++++ b/lib/CodeGen/CodeGenPrepare.cpp
+@@ -190,6 +190,7 @@ class TypePromotionTransaction;
+     bool optimizeShuffleVectorInst(ShuffleVectorInst *SI);
+     bool optimizeSwitchInst(SwitchInst *CI);
+     bool optimizeExtractElementInst(Instruction *Inst);
++    bool optimizeFreezeInst(FreezeInst *FI);
+     bool dupRetToEnableTailCallOpts(BasicBlock *BB);
+     bool placeDbgValues(Function &F);
+     bool sinkAndCmp(Function &F);
+@@ -4812,6 +4813,52 @@ bool CodeGenPrepare::optimizeSwitchInst(SwitchInst *SI) {
+   return true;
+ }
+
++/// If we have a FreezeInst that will inhibit important optimizations,
++/// try to remove the instruction or fold into its operand.
++bool CodeGenPrepare::optimizeFreezeInst(FreezeInst *FI) {
++  /// Handle this case :
++  ///   %cmp = icmp op i32 %x, ConstantInt
++  ///   %cmp.fr = freeze i1 %cmp
++  ///   %x = and/or i1 %cmp.fr, ...
++  /// =>
++  ///   %x.fr = freeze i32 %x
++  ///   %cmp = icmp op i32 %x.fr, ConstantInt
++  ///   %x = and/or i1 %cmp, ...
++  /// We need this because SelectionDAGBuilder::visitBr() tries to
++  /// optimize br i1 (and (icmp ...), (icmp ...)) into two separated
++  /// branches.
++  ICmpInst::Predicate Pred;
++  Value *ICmpLHS;
++  ConstantInt *ICmpRHS;
++  if (match(FI, m_Freeze(m_ICmp(Pred, m_Value(ICmpLHS),
++                                m_ConstantInt(ICmpRHS))))) {
++     // We allow this transformation if FI's users are br / and / or.
++     bool OptCase = true;
++     for (auto itr = FI->user_begin(); itr != FI->user_end(); itr++) {
++       Value *V = *itr;
++       if (isa<BranchInst>(V)) continue;
++       else if (BinaryOperator *Bop = dyn_cast<BinaryOperator>(V)) {
++         if (Bop->getOpcode() == Instruction::And ||
++             Bop->getOpcode() == Instruction::Or)
++           continue;
++       }
++       OptCase = false;
++       break;
++     }
++     if (OptCase) {
++       ICmpInst *ICmp = dyn_cast<ICmpInst>(FI->getOperand(0));
++       FreezeInst *ICmpLHSFr = new FreezeInst(ICmpLHS);
++       // Insert %x.fr
++       ICmpLHSFr->insertBefore(ICmp);
++       ICmp->setOperand(0, ICmpLHSFr);
++       FI->replaceAllUsesWith(ICmp);
++       FI->eraseFromParent();
++       return true;
++     }
++  }
++  return false;
++}
++
+ namespace {
+ /// \brief Helper class to promote a scalar operation to a vector one.
+ /// This class is used to move downward extractelement transition.
+@@ -5231,6 +5278,9 @@ bool CodeGenPrepare::optimizeInst(Instruction *I, bool& ModifiedDT) {
+     if (!TLI || !TLI->hasMultipleConditionRegisters())
+       return OptimizeCmpExpression(CI, TLI);
+
++  if (FreezeInst *FI = dyn_cast<FreezeInst>(I))
++    return optimizeFreezeInst(FI);
++
+   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+     stripInvariantGroupMetadata(*LI);
+     if (TLI) {
+diff --git a/lib/CodeGen/SelectionDAG/LegalizeIntegerTypes.cpp b/lib/CodeGen/SelectionDAG/LegalizeIntegerTypes.cpp
+index f2c548d..685990b 100644
+--- a/lib/CodeGen/SelectionDAG/LegalizeIntegerTypes.cpp
++++ b/lib/CodeGen/SelectionDAG/LegalizeIntegerTypes.cpp
+@@ -151,6 +151,9 @@ void DAGTypeLegalizer::PromoteIntegerResult(SDNode *N, unsigned ResNo) {
+   case ISD::ATOMIC_CMP_SWAP_WITH_SUCCESS:
+     Res = PromoteIntRes_AtomicCmpSwap(cast<AtomicSDNode>(N), ResNo);
+     break;
++  case ISD::FREEZE:
++    Res = PromoteIntRes_FREEZE(N);
++    break;
+   }
+
+   // If the result is null then the sub-method took care of registering it.
+@@ -304,6 +307,12 @@ SDValue DAGTypeLegalizer::PromoteIntRes_BITCAST(SDNode *N) {
+                      CreateStackStoreLoad(InOp, OutVT));
+ }
+
++SDValue DAGTypeLegalizer::PromoteIntRes_FREEZE(SDNode *N) {
++  SDValue V = GetPromotedInteger(N->getOperand(0));
++  return DAG.getNode(N->getOpcode(), SDLoc(N),
++                     V.getValueType(), V);
++}
++
+ SDValue DAGTypeLegalizer::PromoteIntRes_BSWAP(SDNode *N) {
+   SDValue Op = GetPromotedInteger(N->getOperand(0));
+   EVT OVT = N->getValueType(0);
+@@ -915,6 +924,7 @@ bool DAGTypeLegalizer::PromoteIntegerOperand(SDNode *N, unsigned OpNo) {
+   case ISD::SRL:
+   case ISD::ROTL:
+   case ISD::ROTR: Res = PromoteIntOp_Shift(N); break;
++  case ISD::FREEZE: Res = PromoteIntOp_FREEZE(N); break;
+   }
+
+   // If the result is null, the sub-method took care of registering results etc.
+@@ -1266,6 +1276,11 @@ SDValue DAGTypeLegalizer::PromoteIntOp_ZERO_EXTEND(SDNode *N) {
+                                 N->getOperand(0).getValueType().getScalarType());
+ }
+
++SDValue DAGTypeLegalizer::PromoteIntOp_FREEZE(SDNode *N) {
++  SDValue Op = GetPromotedInteger(N->getOperand(0));
++  return DAG.getNode(ISD::FREEZE, SDLoc(N), N->getValueType(0), Op);
++}
++
+
+ //===----------------------------------------------------------------------===//
+ //  Integer Result Expansion
+@@ -1296,6 +1311,7 @@ void DAGTypeLegalizer::ExpandIntegerResult(SDNode *N, unsigned ResNo) {
+   case ISD::SELECT:       SplitRes_SELECT(N, Lo, Hi); break;
+   case ISD::SELECT_CC:    SplitRes_SELECT_CC(N, Lo, Hi); break;
+   case ISD::UNDEF:        SplitRes_UNDEF(N, Lo, Hi); break;
++  case ISD::FREEZE:       SplitRes_FREEZE(N, Lo, Hi); break;
+
+   case ISD::BITCAST:            ExpandRes_BITCAST(N, Lo, Hi); break;
+   case ISD::BUILD_PAIR:         ExpandRes_BUILD_PAIR(N, Lo, Hi); break;
+@@ -2754,6 +2770,7 @@ bool DAGTypeLegalizer::ExpandIntegerOperand(SDNode *N, unsigned OpNo) {
+   case ISD::STORE:   Res = ExpandIntOp_STORE(cast<StoreSDNode>(N), OpNo); break;
+   case ISD::TRUNCATE:          Res = ExpandIntOp_TRUNCATE(N); break;
+   case ISD::UINT_TO_FP:        Res = ExpandIntOp_UINT_TO_FP(N); break;
++  case ISD::FREEZE:            Res = ExpandIntOp_FREEZE(N); break;
+
+   case ISD::SHL:
+   case ISD::SRA:
+@@ -3400,3 +3417,11 @@ SDValue DAGTypeLegalizer::PromoteIntOp_CONCAT_VECTORS(SDNode *N) {
+
+   return DAG.getNode(ISD::BUILD_VECTOR, dl,  N->getValueType(0), NewOps);
+ }
++
++SDValue DAGTypeLegalizer::ExpandIntOp_FREEZE(SDNode *N) {
++  SDValue InL, InH;
++  GetExpandedInteger(N->getOperand(0), InL, InH);
++  return DAG.getNode(ISD::FREEZE, SDLoc(N), N->getValueType(0), InL);
++}
++
++
+diff --git a/lib/CodeGen/SelectionDAG/LegalizeTypes.h b/lib/CodeGen/SelectionDAG/LegalizeTypes.h
+index f1c5ca7..2e6726d 100644
+--- a/lib/CodeGen/SelectionDAG/LegalizeTypes.h
++++ b/lib/CodeGen/SelectionDAG/LegalizeTypes.h
+@@ -262,6 +262,7 @@ private:
+   SDValue PromoteIntRes_EXTRACT_VECTOR_ELT(SDNode *N);
+   SDValue PromoteIntRes_FP_TO_XINT(SDNode *N);
+   SDValue PromoteIntRes_FP_TO_FP16(SDNode *N);
++  SDValue PromoteIntRes_FREEZE(SDNode *N);
+   SDValue PromoteIntRes_INT_EXTEND(SDNode *N);
+   SDValue PromoteIntRes_LOAD(LoadSDNode *N);
+   SDValue PromoteIntRes_MLOAD(MaskedLoadSDNode *N);
+@@ -298,6 +299,7 @@ private:
+   SDValue PromoteIntOp_INSERT_VECTOR_ELT(SDNode *N, unsigned OpNo);
+   SDValue PromoteIntOp_EXTRACT_VECTOR_ELT(SDNode *N);
+   SDValue PromoteIntOp_EXTRACT_SUBVECTOR(SDNode *N);
++  SDValue PromoteIntOp_FREEZE(SDNode *N);
+   SDValue PromoteIntOp_CONCAT_VECTORS(SDNode *N);
+   SDValue PromoteIntOp_SCALAR_TO_VECTOR(SDNode *N);
+   SDValue PromoteIntOp_SELECT(SDNode *N, unsigned OpNo);
+@@ -387,6 +389,7 @@ private:
+   SDValue ExpandIntOp_UINT_TO_FP(SDNode *N);
+   SDValue ExpandIntOp_RETURNADDR(SDNode *N);
+   SDValue ExpandIntOp_ATOMIC_STORE(SDNode *N);
++  SDValue ExpandIntOp_FREEZE(SDNode *N);
+
+   void IntegerExpandSetCCOperands(SDValue &NewLHS, SDValue &NewRHS,
+                                   ISD::CondCode &CCCode, const SDLoc &dl);
+@@ -819,6 +822,7 @@ private:
+   void SplitRes_SELECT      (SDNode *N, SDValue &Lo, SDValue &Hi);
+   void SplitRes_SELECT_CC   (SDNode *N, SDValue &Lo, SDValue &Hi);
+   void SplitRes_UNDEF       (SDNode *N, SDValue &Lo, SDValue &Hi);
++  void SplitRes_FREEZE      (SDNode *N, SDValue &Lo, SDValue &Hi);
+
+   //===--------------------------------------------------------------------===//
+   // Generic Expansion: LegalizeTypesGeneric.cpp
+diff --git a/lib/CodeGen/SelectionDAG/LegalizeTypesGeneric.cpp b/lib/CodeGen/SelectionDAG/LegalizeTypesGeneric.cpp
+index 593c346..deba1c8 100644
+--- a/lib/CodeGen/SelectionDAG/LegalizeTypesGeneric.cpp
++++ b/lib/CodeGen/SelectionDAG/LegalizeTypesGeneric.cpp
+@@ -561,3 +561,12 @@ void DAGTypeLegalizer::SplitRes_UNDEF(SDNode *N, SDValue &Lo, SDValue &Hi) {
+   Lo = DAG.getUNDEF(LoVT);
+   Hi = DAG.getUNDEF(HiVT);
+ }
++
++void DAGTypeLegalizer::SplitRes_FREEZE(SDNode *N, SDValue &Lo, SDValue &Hi) {
++  SDValue L, H;
++  SDLoc dl(N);
++  GetSplitOp(N->getOperand(0), L, H);
++
++  Lo = DAG.getNode(ISD::FREEZE, dl, L.getValueType(), L);
++  Hi = DAG.getNode(ISD::FREEZE, dl, H.getValueType(), H);
++}
+diff --git a/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp b/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
+index de20a60..ca4db47 100644
+--- a/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
++++ b/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
+@@ -9114,3 +9114,12 @@ void SelectionDAGBuilder::visitSwitch(const SwitchInst &SI) {
+     lowerWorkItem(W, SI.getCondition(), SwitchMBB, DefaultMBB);
+   }
+ }
++
++void SelectionDAGBuilder::visitFreeze(const FreezeInst &I) {
++  SDValue N = getValue(I.getOperand(0));
++  SDLoc dl = getCurSDLoc();
++  EVT DestVT = DAG.getTargetLoweringInfo().getValueType(DAG.getDataLayout(),
++                                                        I.getType());
++
++  setValue(&I, DAG.getNode(ISD::FREEZE, dl, DestVT, N));
++}
+diff --git a/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.h b/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.h
+index db3e011..482998a 100644
+--- a/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.h
++++ b/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.h
+@@ -897,6 +897,7 @@ private:
+   void visitAtomicStore(const StoreInst &I);
+   void visitLoadFromSwiftError(const LoadInst &I);
+   void visitStoreToSwiftError(const StoreInst &I);
++  void visitFreeze(const FreezeInst &I);
+
+   void visitInlineAsm(ImmutableCallSite CS);
+   const char *visitIntrinsicCall(const CallInst &I, unsigned Intrinsic);
+diff --git a/lib/CodeGen/SelectionDAG/SelectionDAGDumper.cpp b/lib/CodeGen/SelectionDAG/SelectionDAGDumper.cpp
+index 401da05..5cf86a6 100644
+--- a/lib/CodeGen/SelectionDAG/SelectionDAGDumper.cpp
++++ b/lib/CodeGen/SelectionDAG/SelectionDAGDumper.cpp
+@@ -311,6 +311,7 @@ std::string SDNode::getOperationName(const SelectionDAG *G) const {
+   case ISD::GC_TRANSITION_START:        return "gc_transition.start";
+   case ISD::GC_TRANSITION_END:          return "gc_transition.end";
+   case ISD::GET_DYNAMIC_AREA_OFFSET:    return "get.dynamic.area.offset";
++  case ISD::FREEZE:                     return "FREEZE";
+
+   // Bit manipulation
+   case ISD::BITREVERSE:                 return "bitreverse";
+diff --git a/lib/CodeGen/SelectionDAG/SelectionDAGISel.cpp b/lib/CodeGen/SelectionDAG/SelectionDAGISel.cpp
+index 9be2b14..b36a96b 100644
+--- a/lib/CodeGen/SelectionDAG/SelectionDAGISel.cpp
++++ b/lib/CodeGen/SelectionDAG/SelectionDAGISel.cpp
+@@ -2150,6 +2150,25 @@ void SelectionDAGISel::Select_UNDEF(SDNode *N) {
+   CurDAG->SelectNodeTo(N, TargetOpcode::IMPLICIT_DEF, N->getValueType(0));
+ }
+
++void SelectionDAGISel::Select_FREEZE(SDNode *N) {
++  SDValue Op = N->getOperand(0);
++  EVT Ty = N->getValueType(0);
++  SDLoc dl(N);
++
++  const TargetRegisterClass *RC = TLI->getRegClassFor(Ty.getSimpleVT());
++  // Create a new virtual register.
++  unsigned NewVirtReg = RegInfo->createVirtualRegister(RC);
++  // Create CopyToReg node ('copy 0 into NewVirtReg')
++  SDValue CTRVal = CurDAG->getCopyToReg(CurDAG->getEntryNode(), dl,
++                                        NewVirtReg, Op);
++  // Create CopyFromReg node ('get value from NewVirtReg')
++  SDValue CFRVal = CurDAG->getCopyFromReg(CTRVal, dl, NewVirtReg, Ty);
++  // Mark selected.
++  CTRVal->setNodeId(-1);
++  ReplaceUses(SDValue(N, 0), CFRVal);
++  CurDAG->RemoveDeadNode(N);
++}
++
+ /// GetVBR - decode a vbr encoding whose top bit is set.
+ LLVM_ATTRIBUTE_ALWAYS_INLINE static inline uint64_t
+ GetVBR(uint64_t Val, const unsigned char *MatcherTable, unsigned &Idx) {
+@@ -2776,6 +2795,9 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
+   case ISD::UNDEF:
+     Select_UNDEF(NodeToMatch);
+     return;
++  case ISD::FREEZE:
++    Select_FREEZE(NodeToMatch);
++    return;
+   }
+
+   assert(!NodeToMatch->isMachineOpcode() && "Node already selected!");
+diff --git a/lib/CodeGen/TargetLoweringBase.cpp b/lib/CodeGen/TargetLoweringBase.cpp
+index a4db08a..f4a6231 100644
+--- a/lib/CodeGen/TargetLoweringBase.cpp
++++ b/lib/CodeGen/TargetLoweringBase.cpp
+@@ -1720,6 +1720,7 @@ int TargetLoweringBase::InstructionOpcodeToISD(unsigned Opcode) const {
+   case ExtractValue:   return ISD::MERGE_VALUES;
+   case InsertValue:    return ISD::MERGE_VALUES;
+   case LandingPad:     return 0;
++  case Freeze:         return ISD::FREEZE;
+   }
+
+   llvm_unreachable("Unknown instruction type encountered!");
+diff --git a/lib/IR/Core.cpp b/lib/IR/Core.cpp
+index a553614..a992f6c 100644
+--- a/lib/IR/Core.cpp
++++ b/lib/IR/Core.cpp
+@@ -3018,6 +3018,10 @@ LLVMValueRef LLVMBuildInsertValue(LLVMBuilderRef B, LLVMValueRef AggVal,
+                                            Index, Name));
+ }
+
++LLVMValueRef LLVMBuildFreeze(LLVMBuilderRef B, LLVMValueRef Val, const char *Name) {
++  return wrap(unwrap(B)->CreateFreeze(unwrap(Val), Name));
++}
++
+ LLVMValueRef LLVMBuildIsNull(LLVMBuilderRef B, LLVMValueRef Val,
+                              const char *Name) {
+   return wrap(unwrap(B)->CreateIsNull(unwrap(Val), Name));
+diff --git a/lib/IR/Instruction.cpp b/lib/IR/Instruction.cpp
+index 6ca5c8c..399528c 100644
+--- a/lib/IR/Instruction.cpp
++++ b/lib/IR/Instruction.cpp
+@@ -330,6 +330,7 @@ const char *Instruction::getOpcodeName(unsigned OpCode) {
+   case InsertValue:    return "insertvalue";
+   case LandingPad:     return "landingpad";
+   case CleanupPad:     return "cleanuppad";
++  case Freeze:         return "freeze";
+
+   default: return "<Invalid operator> ";
+   }
+diff --git a/lib/IR/Instructions.cpp b/lib/IR/Instructions.cpp
+index 6f60d15..a2747a1 100644
+--- a/lib/IR/Instructions.cpp
++++ b/lib/IR/Instructions.cpp
+@@ -3855,6 +3855,22 @@ void IndirectBrInst::setSuccessorV(unsigned idx, BasicBlock *B) {
+ }
+
+ //===----------------------------------------------------------------------===//
++//                            FreezeInst Implementation
++//===----------------------------------------------------------------------===//
++
++FreezeInst::FreezeInst(Value *S,
++                       const Twine &Name, Instruction *InsertBefore)
++    : UnaryInstruction(S->getType(), Freeze, S, InsertBefore) {
++  setName(Name);
++}
++
++FreezeInst::FreezeInst(Value *S,
++                       const Twine &Name, BasicBlock *InsertAtEnd)
++    : UnaryInstruction(S->getType(), Freeze, S, InsertAtEnd) {
++  setName(Name);
++}
++
++//===----------------------------------------------------------------------===//
+ //                           cloneImpl() implementations
+ //===----------------------------------------------------------------------===//
+
+@@ -4056,3 +4072,41 @@ UnreachableInst *UnreachableInst::cloneImpl() const {
+   LLVMContext &Context = getContext();
+   return new UnreachableInst(Context);
+ }
++
++FreezeInst *FreezeInst::cloneImpl() const {
++  return new FreezeInst(getOperand(0));
++}
++
++bool FreezeInst::isGuaranteedNotToBeUndef(Value *V) {
++  if (Instruction *I = dyn_cast<Instruction>(V)) {
++    if (isa<FreezeInst>(I))
++      return true;
++
++    // We are currently conservative. Handle each case later.
++    // For now we don't use recursive calls because of circular definitions.
++    if (ICmpInst *IC = dyn_cast<ICmpInst>(I)) {
++      return false;
++    }
++    if (FCmpInst *FC = dyn_cast<FCmpInst>(I)) {
++      return false;
++    }
++    if (PHINode *PN = dyn_cast<PHINode>(I)) {
++      return false;
++    }
++    if (SelectInst *SI = dyn_cast<SelectInst>(I)) {
++      return false;
++    }
++
++    return false;
++  }
++  if (Constant *C = dyn_cast<Constant>(V)) {
++    if (isa<ConstantInt>(C) || isa<ConstantFP>(C) ||
++        isa<ConstantPointerNull>(C) || isa<GlobalObject>(C))
++      return true;
++
++    return false;
++  }
++
++  // return false for others such as Arguments
++  return false;
++}
+diff --git a/lib/IR/Verifier.cpp b/lib/IR/Verifier.cpp
+index cd8e309..f06a09b 100644
+--- a/lib/IR/Verifier.cpp
++++ b/lib/IR/Verifier.cpp
+@@ -434,6 +434,7 @@ private:
+   void visitFuncletPadInst(FuncletPadInst &FPI);
+   void visitCatchSwitchInst(CatchSwitchInst &CatchSwitch);
+   void visitCleanupReturnInst(CleanupReturnInst &CRI);
++  void visitFreezeInst(FreezeInst &FI);
+
+   void verifyCallSite(CallSite CS);
+   void verifySwiftErrorCallSite(CallSite CS, const Value *SwiftErrorVal);
+@@ -3531,6 +3532,13 @@ void Verifier::visitCleanupReturnInst(CleanupReturnInst &CRI) {
+   visitTerminatorInst(CRI);
+ }
+
++void Verifier::visitFreezeInst(FreezeInst &FI) {
++  Assert(FI.getOperand(0)->getType()->isIntegerTy(),
++         "Cannot freeze non-integer type!", &FI);
++
++  visitInstruction(FI);
++}
++
+ void Verifier::verifyDominatesUse(Instruction &I, unsigned i) {
+   Instruction *Op = cast<Instruction>(I.getOperand(i));
+   // If the we have an invalid invoke, don't try to compute the dominance.
+diff --git a/lib/Transforms/InstCombine/CMakeLists.txt b/lib/Transforms/InstCombine/CMakeLists.txt
+index 0ed8e62..7baa596 100644
+--- a/lib/Transforms/InstCombine/CMakeLists.txt
++++ b/lib/Transforms/InstCombine/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_llvm_library(LLVMInstCombine
+   InstCombineShifts.cpp
+   InstCombineSimplifyDemanded.cpp
+   InstCombineVectorOps.cpp
++  InstCombineFreeze.cpp
+
+   ADDITIONAL_HEADER_DIRS
+   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms
+diff --git a/lib/Transforms/InstCombine/InstCombineFreeze.cpp b/lib/Transforms/InstCombine/InstCombineFreeze.cpp
+new file mode 100644
+index 0000000..4e92016
+--- /dev/null
++++ b/lib/Transforms/InstCombine/InstCombineFreeze.cpp
+@@ -0,0 +1,31 @@
++//===- InstCombineFreeze.cpp ----------------------------------------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the visitFreeze function.
++//
++//===----------------------------------------------------------------------===//
++
++#include "InstCombineInternal.h"
++#include "llvm/Analysis/InstructionSimplify.h"
++using namespace llvm;
++using namespace PatternMatch;
++
++#define DEBUG_TYPE "instcombine"
++
++Instruction *InstCombiner::visitFreeze(FreezeInst &FI) {
++  Value *Op0 = FI.getOperand(0);
++
++  if (Value *V = SimplifyFreezeInst(Op0, DL, TLI, DT, AC))
++    return replaceInstUsesWith(FI, V);
++
++  if (FreezeInst *Op0_FI = dyn_cast<FreezeInst>(Op0))
++    return replaceInstUsesWith(FI, Op0_FI);
++
++  return nullptr;
++}
+diff --git a/lib/Transforms/InstCombine/InstCombineInternal.h b/lib/Transforms/InstCombine/InstCombineInternal.h
+index 0f1121a..88c5ec6 100644
+--- a/lib/Transforms/InstCombine/InstCombineInternal.h
++++ b/lib/Transforms/InstCombine/InstCombineInternal.h
+@@ -312,6 +312,7 @@ public:
+   Instruction *visitSelectInstWithICmp(SelectInst &SI, ICmpInst *ICI);
+   Instruction *visitCallInst(CallInst &CI);
+   Instruction *visitInvokeInst(InvokeInst &II);
++  Instruction *visitFreeze(FreezeInst &FI);
+
+   Instruction *SliceUpIllegalIntegerPHI(PHINode &PN);
+   Instruction *visitPHINode(PHINode &PN);
+diff --git a/lib/Transforms/InstCombine/InstCombineSelect.cpp b/lib/Transforms/InstCombine/InstCombineSelect.cpp
+index 7c3ef99..eafd524 100644
+--- a/lib/Transforms/InstCombine/InstCombineSelect.cpp
++++ b/lib/Transforms/InstCombine/InstCombineSelect.cpp
+@@ -199,7 +199,30 @@ Instruction *InstCombiner::FoldSelectOpOp(SelectInst &SI, Instruction *TI,
+   }
+
+   // If we reach here, they do have operations in common.
+-  Value *NewSI = Builder->CreateSelect(SI.getCondition(), OtherOpT,
++  // Freeze the condition value to prevent this case :
++  //   <src>                 |      <tgt>
++  // X = udiv A, B           |
++  // Y = udiv A, C           | t' = select undef, B, C (which is undef)
++  // Z = select undef, X, Y  | Z = udiv A, t' (which is UB)
++  Value *Cond = SI.getCondition();
++  switch (TI->getOpcode()) {
++  default : break;
++  case Instruction::UDiv:
++  case Instruction::URem:
++  case Instruction::SDiv:
++  case Instruction::SRem:
++    if (!isa<Constant>(SI.getCondition()) &&
++        !isa<TerminatorInst>(SI.getCondition()))
++      // Create Freeze at the definition of condition value, and
++      // replace all uses of SI.getCondition() with the new freeze instruction.
++      Cond = Builder->CreateFreezeAtDef(Cond,
++                                       SI.getParent()->getParent(),
++                                       Cond->getName() + ".fr");
++    else
++      Cond = Builder->CreateFreeze(Cond,
++                                   Cond->getName() + ".fr");
++  }
++  Value *NewSI = Builder->CreateSelect(Cond, OtherOpT,
+                                        OtherOpF, SI.getName()+".v");
+
+   if (BinaryOperator *BO = dyn_cast<BinaryOperator>(TI)) {
+diff --git a/lib/Transforms/Scalar/LoopUnswitch.cpp b/lib/Transforms/Scalar/LoopUnswitch.cpp
+index 71980e8..bba5908 100644
+--- a/lib/Transforms/Scalar/LoopUnswitch.cpp
++++ b/lib/Transforms/Scalar/LoopUnswitch.cpp
+@@ -37,6 +37,7 @@
+ #include "llvm/Analysis/LoopInfo.h"
+ #include "llvm/Analysis/LoopPass.h"
+ #include "llvm/Analysis/ScalarEvolution.h"
++#include "llvm/Analysis/ValueTracking.h"
+ #include "llvm/Analysis/TargetTransformInfo.h"
+ #include "llvm/Analysis/BlockFrequencyInfoImpl.h"
+ #include "llvm/Analysis/BlockFrequencyInfo.h"
+@@ -239,11 +240,13 @@ namespace {
+     bool TryTrivialLoopUnswitch(bool &Changed);
+
+     bool UnswitchIfProfitable(Value *LoopCond, Constant *Val,
+-                              TerminatorInst *TI = nullptr);
++                              TerminatorInst *TI = nullptr,
++                              bool NeedFreeze = true);
+     void UnswitchTrivialCondition(Loop *L, Value *Cond, Constant *Val,
+-                                  BasicBlock *ExitBlock, TerminatorInst *TI);
++                                  BasicBlock *ExitBlock, TerminatorInst *TI,
++                                  bool NeedFreeze);
+     void UnswitchNontrivialCondition(Value *LIC, Constant *OnVal, Loop *L,
+-                                     TerminatorInst *TI);
++                                     TerminatorInst *TI, bool NeedFreeze);
+
+     void RewriteLoopBodyWithConditionConstant(Loop *L, Value *LIC,
+                                               Constant *Val, bool isEqual);
+@@ -566,7 +569,8 @@ bool LoopUnswitch::processCurrentLoop() {
+     Value *LoopCond =
+         FindLIVLoopCondition(Guard->getOperand(0), currentLoop, Changed);
+     if (LoopCond &&
+-        UnswitchIfProfitable(LoopCond, ConstantInt::getTrue(Context))) {
++        UnswitchIfProfitable(LoopCond, ConstantInt::getTrue(Context),
++                             nullptr, true)) {
+       // NB! Unswitching (if successful) could have erased some of the
+       // instructions in Guards leaving dangling pointers there.  This is fine
+       // because we're returning now, and won't look at Guards again.
+@@ -592,6 +596,56 @@ bool LoopUnswitch::processCurrentLoop() {
+         !isGuaranteedToExecute(*TI, DT, currentLoop, &SafetyInfo))
+       continue;
+
++    // Do we need to freeze condition of TI?
++    // Here we use simple heuristic :
++    // If TI is in header, and all instructions
++    // between header beginning and TI are guaranteed to transfer execution
++    // to successor, then don't freeze.
++    bool NeedFreeze = true;
++    {
++      bool UnconditionallyGotoTI = true;
++      BasicBlock *BB = currentLoop->getHeader();
++      while (BB) {
++        TerminatorInst *BBTI = BB->getTerminator();
++        if (BBTI == TI)
++          // There's a unique path from header to TI
++          break;
++        else if (BBTI->getNumSuccessors() == 1)
++          BB = BBTI->getSuccessor(0);
++        else {
++          BB = nullptr;
++          UnconditionallyGotoTI = false;
++        }
++      }
++      if (UnconditionallyGotoTI) {
++        // Now we check whether all instructions from header to
++        // TI guarantees to transfer execution to successor.
++        NeedFreeze = false;
++        BB = currentLoop->getHeader();
++        while (BB) {
++          for(auto I = BB->begin(), E = BB->end(); I != E; ) {
++            Instruction *Inst = &(*I);
++            if (!isGuaranteedToTransferExecutionToSuccessor(Inst)) {
++              NeedFreeze = true;
++              break;
++            }
++            ++I;
++          }
++          if (NeedFreeze) break;
++
++          TerminatorInst *BBTI = BB->getTerminator();
++          if (BBTI == TI)
++            // There's a unique path from header to TI
++            break;
++          else {
++            assert ((BBTI->getNumSuccessors() == 1) &&
++                    "Should have no more than 1 successors");
++            BB = BBTI->getSuccessor(0);
++          }
++        }
++      }
++    }
++
+     if (BranchInst *BI = dyn_cast<BranchInst>(TI)) {
+       // If this isn't branching on an invariant condition, we can't unswitch
+       // it.
+@@ -600,8 +654,11 @@ bool LoopUnswitch::processCurrentLoop() {
+         // unswitch on it if we desire.
+         Value *LoopCond = FindLIVLoopCondition(BI->getCondition(),
+                                                currentLoop, Changed);
++        // Determine whether to freeze condition variable or not.
++        // This branch (BI) must be guaranteed to execute, e.g.
+         if (LoopCond &&
+-            UnswitchIfProfitable(LoopCond, ConstantInt::getTrue(Context), TI)) {
++            UnswitchIfProfitable(LoopCond, ConstantInt::getTrue(Context), TI,
++                                 NeedFreeze)) {
+           ++NumBranches;
+           return true;
+         }
+@@ -631,7 +688,7 @@ bool LoopUnswitch::processCurrentLoop() {
+         if (!UnswitchVal)
+           continue;
+
+-        if (UnswitchIfProfitable(LoopCond, UnswitchVal)) {
++        if (UnswitchIfProfitable(LoopCond, UnswitchVal, nullptr, NeedFreeze)) {
+           ++NumSwitches;
+           return true;
+         }
+@@ -645,7 +702,8 @@ bool LoopUnswitch::processCurrentLoop() {
+         Value *LoopCond = FindLIVLoopCondition(SI->getCondition(),
+                                                currentLoop, Changed);
+         if (LoopCond && UnswitchIfProfitable(LoopCond,
+-                                             ConstantInt::getTrue(Context))) {
++                                             ConstantInt::getTrue(Context),
++                                             nullptr, true)) {
+           ++NumSelects;
+           return true;
+         }
+@@ -708,7 +766,8 @@ static BasicBlock *isTrivialLoopExitBlock(Loop *L, BasicBlock *BB) {
+ /// simplify the loop.  If we decide that this is profitable,
+ /// unswitch the loop, reprocess the pieces, then return true.
+ bool LoopUnswitch::UnswitchIfProfitable(Value *LoopCond, Constant *Val,
+-                                        TerminatorInst *TI) {
++                                        TerminatorInst *TI,
++                                        bool NeedFreeze) {
+   // Check to see if it would be profitable to unswitch current loop.
+   if (!BranchesInfo.CostAllowsUnswitching()) {
+     DEBUG(dbgs() << "NOT unswitching loop %"
+@@ -719,7 +778,7 @@ bool LoopUnswitch::UnswitchIfProfitable(Value *LoopCond, Constant *Val,
+     return false;
+   }
+
+-  UnswitchNontrivialCondition(LoopCond, Val, currentLoop, TI);
++  UnswitchNontrivialCondition(LoopCond, Val, currentLoop, TI, NeedFreeze);
+   return true;
+ }
+
+@@ -816,7 +875,8 @@ void LoopUnswitch::EmitPreheaderBranchOnCondition(Value *LIC, Constant *Val,
+ /// outside of the loop and updating loop info.
+ void LoopUnswitch::UnswitchTrivialCondition(Loop *L, Value *Cond, Constant *Val,
+                                             BasicBlock *ExitBlock,
+-                                            TerminatorInst *TI) {
++                                            TerminatorInst *TI,
++                                            bool NeedFreeze) {
+   DEBUG(dbgs() << "loop-unswitch: Trivial-Unswitch loop %"
+                << loopHeader->getName() << " [" << L->getBlocks().size()
+                << " blocks] in Function "
+@@ -839,6 +899,21 @@ void LoopUnswitch::UnswitchTrivialCondition(Loop *L, Value *Cond, Constant *Val,
+   assert(!L->contains(ExitBlock) && "Exit block is in the loop?");
+   BasicBlock *NewExit = SplitBlock(ExitBlock, &ExitBlock->front(), DT, LI);
+
++  // Freeze
++  if (NeedFreeze) {
++    IRBuilder<> Builder(NewPH);
++    if (isa<TerminatorInst>(Cond)) {
++      // Terminator with a return value.
++      // InvokeInst is the only case now (LLVM 3.9)
++      FreezeInst *FI = new FreezeInst(Cond, Cond->getName() + ".fr");
++      FI->insertBefore(loopPreheader->getTerminator());
++      Cond = FI;
++    } else {
++      Cond = Builder.CreateFreezeAtDef(Cond, ExitBlock->getParent(),
++                                       Cond->getName() + ".fr");
++    }
++  }
++
+   // Okay, now we have a position to branch from and a position to branch to,
+   // insert the new conditional branch.
+   EmitPreheaderBranchOnCondition(Cond, Val, NewExit, NewPH,
+@@ -883,6 +958,11 @@ bool LoopUnswitch::TryTrivialLoopUnswitch(bool &Changed) {
+   // this scenario could be very common in practice.
+   SmallSet<BasicBlock*, 8> Visited;
+
++  // If there exists an instruction I which is (1) between the beginning of
++  // the loop header and a branch to unswitch, and (1) not guaranteed to
++  // transfer execution to successor, then we need to freeze the condition,
++  // because if condition is poison it may introduce br poison, which is UB.
++  bool NeedFreeze = false;
+   while (true) {
+     // If we exit loop or reach a previous visited block, then
+     // we can not reach any trivial condition candidates (unfoldable
+@@ -894,9 +974,15 @@ bool LoopUnswitch::TryTrivialLoopUnswitch(bool &Changed) {
+     // Check if this loop will execute any side-effecting instructions (e.g.
+     // stores, calls, volatile loads) in the part of the loop that the code
+     // *would* execute. Check the header first.
+-    for (Instruction &I : *CurrentBB)
++    for (Instruction &I : *CurrentBB) {
+       if (I.mayHaveSideEffects())
+         return false;
++      if (!NeedFreeze
++          && isGuaranteedToTransferExecutionToSuccessor(&I))
++        // There exists an instruction which can exit from the loop.
++        // Hoisting branch must not have poison as its condition.
++        NeedFreeze = true;
++    }
+
+     // FIXME: add check for constant foldable switch instructions.
+     if (BranchInst *BI = dyn_cast<BranchInst>(CurrentTerm)) {
+@@ -953,7 +1039,7 @@ bool LoopUnswitch::TryTrivialLoopUnswitch(bool &Changed) {
+       return false;   // Can't handle this.
+
+     UnswitchTrivialCondition(currentLoop, LoopCond, CondVal, LoopExitBB,
+-                             CurrentTerm);
++                             CurrentTerm, NeedFreeze);
+     ++NumBranches;
+     return true;
+   } else if (SwitchInst *SI = dyn_cast<SwitchInst>(CurrentTerm)) {
+@@ -996,7 +1082,7 @@ bool LoopUnswitch::TryTrivialLoopUnswitch(bool &Changed) {
+       return false;   // Can't handle this.
+
+     UnswitchTrivialCondition(currentLoop, LoopCond, CondVal, LoopExitBB,
+-                             nullptr);
++                             nullptr, NeedFreeze);
+     ++NumSwitches;
+     return true;
+   }
+@@ -1024,7 +1110,8 @@ void LoopUnswitch::SplitExitEdges(Loop *L,
+ /// Split it into loop versions and test the condition outside of either loop.
+ /// Return the loops created as Out1/Out2.
+ void LoopUnswitch::UnswitchNontrivialCondition(Value *LIC, Constant *Val,
+-                                               Loop *L, TerminatorInst *TI) {
++                                               Loop *L, TerminatorInst *TI,
++                                               bool NeedFreeze) {
+   Function *F = loopHeader->getParent();
+   DEBUG(dbgs() << "loop-unswitch: Unswitching loop %"
+         << loopHeader->getName() << " [" << L->getBlocks().size()
+@@ -1142,6 +1229,23 @@ void LoopUnswitch::UnswitchNontrivialCondition(Value *LIC, Constant *Val,
+          "Preheader splitting did not work correctly!");
+
+   // Emit the new branch that selects between the two versions of this loop.
++
++  if (NeedFreeze) {
++    // Freeze the condition
++    IRBuilder<> Builder(loopPreheader);
++    if (isa<TerminatorInst>(LIC)) {
++      // Terminator with a return value.
++      // InvokeInst is the only case now (LLVM 3.9)
++      FreezeInst *FI = new FreezeInst(LIC, LIC->getName() + ".fr");
++      FI->insertBefore(OldBR);
++      LIC = FI;
++    } else {
++      // Put freeze at def of LIC, and replace all uses with new freeze
++      LIC = Builder.CreateFreezeAtDef(LIC, loopPreheader->getParent(),
++                                      LIC->getName() + ".fr");
++    }
++  }
++
+   EmitPreheaderBranchOnCondition(LIC, Val, NewBlocks[0], LoopBlocks[0], OldBR,
+                                  TI);
+   LPM->deleteSimpleAnalysisValue(OldBR, L);
+diff --git a/lib/Transforms/Scalar/SCCP.cpp b/lib/Transforms/Scalar/SCCP.cpp
+index d4c156e..7636a18 100644
+--- a/lib/Transforms/Scalar/SCCP.cpp
++++ b/lib/Transforms/Scalar/SCCP.cpp
+@@ -512,6 +512,9 @@ private:
+   void visitAllocaInst    (Instruction &I) { markOverdefined(&I); }
+   void visitVAArgInst     (Instruction &I) { markAnythingOverdefined(&I); }
+
++  // Don't handle freeze instructions for now.
++  void visitFreezeInst    (FreezeInst &I) { markAnythingOverdefined(&I); }
++
+   void visitInstruction(Instruction &I) {
+     // If a new instruction is added to LLVM that we don't handle.
+     dbgs() << "SCCP: Don't know how to handle: " << I << '\n';
