@@ -4,6 +4,7 @@ if [ "$#" -ne 2 ]; then
 	exit 1
 fi
 
+mkdir -p $2
 dir=`pwd`
 for i in bzip2 gzip gcc oggenc sqlite3 ; do
   echo "START $i"

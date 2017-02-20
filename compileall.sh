@@ -5,6 +5,7 @@ if [ "$#" -ne 2 ]; then
 fi
 
 dir=`pwd`
+mkdir -p $2
 for j in bzip2 gzip gcc oggenc sqlite3 ; do
   $1/bin/clang -O3 -w -c -o $2/${j}.o $dir/singlefileprograms/$j/${j}.c
   $1/bin/clang -O3 -w -S -emit-llvm -o $2/${j}.ll $dir/singlefileprograms/$j/${j}.c

@@ -6,6 +6,7 @@ fi
 
 LLVM=$1
 OUTPUT=$2
+mkdir -p $OUTPUT
 for i in bzip2 gzip oggenc gcc sqlite3 ; do
   (./memfootprint.sh > ${OUTPUT}/${i}.memfoot.txt) & echo "MemRecord start"
   echo "START $i"
