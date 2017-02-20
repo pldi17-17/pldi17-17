@@ -14,3 +14,9 @@ for i in bzip2 gzip oggenc gcc sqlite3 ; do
   PIDVAL=`pgrep memfootprint.sh`
   kill $PIDVAL
 done
+
+for i in `ls $2/*.memfoot.txt` ; do
+  echo $i
+  python parse-memfoot.py ${i} ${i}.csv
+  python analyze-memfoot-csv.py ${i}.summary.csv ${i}.csv
+done

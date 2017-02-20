@@ -1,6 +1,6 @@
 #!/bin/bash
 if [ "$#" -ne 2 ]; then
-	echo "./compiletime.sh <llvm-dir> <output-dir>"
+	echo "./compiletime-cpuset.sh <llvm-dir> <output-dir>"
 	exit 1
 fi
 

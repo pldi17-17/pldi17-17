@@ -1,6 +1,6 @@
 #!/bin/bash
 if [ "$#" -ne 2 ]; then
-	echo "./memfoot.sh <llvm-dir> <output-dir>"
+	echo "./memfoot-cpuset.sh <llvm-dir> <output-dir>"
 	exit 1
 fi
 

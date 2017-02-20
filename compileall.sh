@@ -1,6 +1,6 @@
 #!/bin/bash
 if [ "$#" -ne 2 ]; then
-	echo "./compile.sh <llvm-dir> <output-dir>"
+	echo "./compileall.sh <llvm-dir> <output-dir>"
 	exit 1
 fi
 
