@@ -26,7 +26,7 @@
 ### Setup For Performance Consistency
 
 - Disable gui and network service
-- Disable ASLR : htp://askubuntu.com/questions/318315/how-can-i-temporarily-disable-aslr-address-space-layout-randomization
+- Disable ASLR : http://askubuntu.com/questions/318315/how-can-i-temporarily-disable-aslr-address-space-layout-randomization
 - Disable Intel Hyper-Threading, TurboBoost, Turbo mode, SpeedStep
 - Set scaling governor to 'performance' : https://wiki.archlinux.org/index.php/CPU_frequency_scaling
     - `sudo cpupower frequency-set -g performance`
