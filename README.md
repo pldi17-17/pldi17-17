@@ -1,22 +1,24 @@
-### PLDI'17 Artifact Evaluation
+## PLDI'17 Artifact Evaluation
 
-- Title : Taming Undefiend Behavior in LLVM
+- Title : Taming Undefined Behavior in LLVM
 
-### Running Experiment
+## Running Experiment
 
 - See artifacteval.pdf
 
-#### Using cpuset
+### Using cpuset
 
 - `cpuset` is a tool that dedicates specific cores to some performance-critical processes.
 - Running experiment with `cpuset` :
+    
     (1) Create a new user - our script is tailored to an imaginary user `pldi1717` with password `pldi201717`, who has sudoer's priviledge.
     (2) Install `cpuset` by running `install-cpuset.sh`
     (3) For each experiment, modify scripts according to `artifacteval.pdf`
     (4) Download this artifact & run experiment on user `pldi1717`
+
 - Note : you can't use `cpuset` if your system has only one core.
 
-#### Setup For Performance Consistency
+### Setup For Performance Consistency
 
 - Disable gui and network service
 - Disable ASLR : htp://askubuntu.com/questions/318315/how-can-i-temporarily-disable-aslr-address-space-layout-randomization
