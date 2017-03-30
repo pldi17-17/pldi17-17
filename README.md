@@ -33,4 +33,7 @@
     - Check with `cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`
 - Let benchmark programs fully use your computer's resource.
 
+### Troubleshooting
 
+- If running `instcounter/instcounter` yields an error saying it can't find
+    `libLLVMxx.so`, add path `<llvm-dir>/lib` to the environment variable `LD\_LIBRARY\_PATH`.
