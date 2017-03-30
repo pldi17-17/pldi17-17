@@ -4,6 +4,11 @@ import sys
 import csv
 
 def all_within_rate(l, v):
+  for f in l:
+    f = float(f)
+    # Even 1% noise is big in compiler performance test.
+    if (f < 0.99 * v) or (1.01 * v < f):
+      return False
   return True
 
 def baseval(l):
@@ -78,7 +83,7 @@ def slowdown_and_sort(inputfilepath, outputfilepath, filterout_fluctuatingresult
   return (alldata_sorted, totelapsedtime)
 
 if len(sys.argv) <> 3:
-  print "python sort.py <input-rt.csv> <output-rt.csv>"
+  print "python sort-lnt.py <input-rt.csv> <output-rt.csv>"
   exit(1)
 
 slowdown_and_sort(sys.argv[1], sys.argv[2], True)
