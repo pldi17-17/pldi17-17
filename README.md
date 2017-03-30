@@ -30,6 +30,12 @@
 (2) After that, uncomment the lines (198 - 202), and comment 
 line 197.
 
+#### 2. Compiling Large Single File Programs with cpuset
+
+(1) Replace `/mnt/freezedisk/cpuset` in `compiletime-cpuset.sh` (or `memfoot-cpuset.sh`) with _absolute_ path of `pldi17-ae/cpuset`.
+
+(2) Run `compiletime-cpuset.sh` (or `memfoot-cpuset.sh`) instead of `compiletime.sh` (or `memfoot.sh`).
+
 ### Setup For Performance Consistency
 
 - Disable gui and network service
