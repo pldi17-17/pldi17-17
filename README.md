@@ -8,7 +8,7 @@
 
 ### Using cpuset
 
-- `cpuset` is a tool that dedicates specific cores to some performance-critical processes.
+- `cpuset` is a tool that reserves specific cores to processes.
 - Running experiment with `cpuset` :
     
     (1) Create a new user - our script is tailored to an imaginary user `pldi1717` with password `pldi201717`, who has sudoer's priviledge.
