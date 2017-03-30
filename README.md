@@ -23,9 +23,9 @@
 
 - Note : you can't use `cpuset` if your system has only one core.
 
-#### Running LNT with cpuset
+#### 1. Running LNT with cpuset
 
-(1) You should modify `llvm-test-suite/RunSafely.sh'. Please replace the word `/mnt/freezedisk/cpuset' _absolute_ path of `pldi17-ae/cpuset'. 
+(1) You should modify `llvm-test-suite/RunSafely.sh`. Please replace the word `/mnt/freezedisk/cpuset` with _absolute_ path of `pldi17-ae/cpuset`. 
 
 (2) After that, uncomment the lines (198 - 202), and comment 
 line 197.
