@@ -17,11 +17,18 @@
     
     (3) Install `cpuset` by running `install-cpuset.sh`
     
-    (4) For each experiment, modify scripts according to `artifacteval.pdf`
+    (4) For each experiment, modify script so cpuset path can be properly set (detail will be written below)
     
     (5) Run experiment on user `pldi1717`
 
 - Note : you can't use `cpuset` if your system has only one core.
+
+#### Running LNT with cpuset
+
+(1) You should modify `llvm-test-suite/RunSafely.sh'. Please replace the word `/mnt/freezedisk/cpuset' _absolute_ path of `pldi17-ae/cpuset'. 
+
+(2) After that, uncomment the lines (198 - 202), and comment 
+line 197.
 
 ### Setup For Performance Consistency
 
