@@ -12,9 +12,14 @@
 - Running experiment with `cpuset` :
     
     (1) Create a new user - our script is tailored to an imaginary user `pldi1717` with password `pldi201717`, who has sudoer's priviledge.
-    (2) Install `cpuset` by running `install-cpuset.sh`
-    (3) For each experiment, modify scripts according to `artifacteval.pdf`
-    (4) Download this artifact & run experiment on user `pldi1717`
+    
+    (2) Log in to user `pldi1717`, and extract(or clone) this artifact 
+    
+    (3) Install `cpuset` by running `install-cpuset.sh`
+    
+    (4) For each experiment, modify scripts according to `artifacteval.pdf`
+    
+    (5) Run experiment on user `pldi1717`
 
 - Note : you can't use `cpuset` if your system has only one core.
 
@@ -27,4 +32,5 @@
     - `sudo cpupower frequency-set -g performance`
     - Check with `cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`
 - Let benchmark programs fully use your computer's resource.
+
 
